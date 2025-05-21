@@ -297,6 +297,10 @@ class SequenceDataset(torch.utils.data.Dataset):
             if "model_file" in hdf5_file["data/{}".format(ep)].attrs:
                 all_data[ep]["attrs"]["model_file"] = hdf5_file["data/{}".format(ep)].attrs["model_file"]
 
+            if "camera_info" in hdf5_file["data/{}".format(ep)].attrs:
+                all_data[ep]["attrs"]["camera_info"] = hdf5_file["data/{}".format(ep)].attrs["camera_info"]
+                # print(all_data[ep]["attrs"]["camera_info"])
+
         return all_data
 
     def normalize_obs(self):
