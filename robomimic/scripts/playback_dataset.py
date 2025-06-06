@@ -173,6 +173,7 @@ def playback_trajectory_with_obs(
     video_count = 0
 
     traj_len = traj_grp["actions"].shape[0]
+    print("Traj len: ", traj_len)
     for i in range(traj_len):
         if video_count % video_skip == 0:
             # concatenate image obs together

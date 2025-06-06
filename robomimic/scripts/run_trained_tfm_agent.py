@@ -130,7 +130,7 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
                 if video_count % video_skip == 0:
                     video_img = []
                     for cam_name in camera_names:
-                        video_img.append(env.render(mode="rgb_array", height=512, width=512, camera_name=cam_name))
+                        video_img.append(env.render(mode="rgb_array", height=256, width=256, camera_name=cam_name))
                     video_img = np.concatenate(video_img, axis=1) # concatenate horizontally
                     video_writer.append_data(video_img)
                 video_count += 1
@@ -190,9 +190,15 @@ def run_trained_agent(args):
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
 
     # restore policy
-    if args.tfm_policy_cfg is not None:
-        from tfm.models.robomimic_algo import TFMAlgo
-        policy = RolloutPolicy(TFMAlgo(args.tfm_policy_cfg))
+    if args.tfm_policy_cfg is not None or args.e2e_policy_cfg is not None:
+        if args.tfm_policy_cfg is not None:
+            from tfm.models.robomimic_algo import TFMAlgo
+            policy = RolloutPolicy(TFMAlgo(args.tfm_policy_cfg, log_wandb=args.use_wandb))
+        elif args.e2e_policy_cfg is not None:
+            from tfm.models.robomimic_algo import E2ETFMAlgo
+            policy = RolloutPolicy(E2ETFMAlgo(args.e2e_policy_cfg, log_wandb=args.use_wandb))
+        else:
+            raise ValueError("Either tfm_policy_cfg or e2e_policy_cfg must be provided")
 
         robomimic_data_config = {
             "obs": {
@@ -223,6 +229,24 @@ def run_trained_agent(args):
 
     # create environment from saved checkpoint
     env_meta = FileUtils.get_env_metadata_from_dataset(args.env_dataset_path)
+    controller_config = {
+        'type': 'JOINT_POSITION', 
+        'input_max': np.pi, 
+        'input_min': -np.pi, 
+        'output_max': np.pi, 
+        'output_min': -np.pi, 
+        'kp': 50, 
+        'damping_ratio': 1, 
+        'input_type': 'absolute',
+        'impedance_mode': 'fixed', 
+        'kp_limits': [0, 300], 
+        'damping_ratio_limits': [0, 10], 
+        'qpos_limits': None, 
+        'interpolation': None, 
+        'ramp_ratio': 0.2,
+        'gripper': {'type': 'GRIP'},
+    }
+    env_meta['env_kwargs']['controller_configs']['body_parts']['right'] = controller_config
     env_meta["env_kwargs"]["camera_names"].remove("robot0_eye_in_hand")
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
@@ -251,6 +275,11 @@ def run_trained_agent(args):
         data_writer = h5py.File(args.dataset_path, "w")
         data_grp = data_writer.create_group("data")
         total_samples = 0
+
+    if args.use_wandb:
+        import wandb
+        import datetime
+        wandb.init(project="tfm-rollouts", name=datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
 
     rollout_stats = []
     for i in range(rollout_num_episodes):
@@ -284,11 +313,11 @@ def run_trained_agent(args):
             ep_data_grp.attrs["num_samples"] = traj["actions"].shape[0] # number of transitions in this episode
             total_samples += traj["actions"].shape[0]
 
-    rollout_stats = TensorUtils.list_of_flat_dict_to_dict_of_list(rollout_stats)
-    avg_rollout_stats = { k : np.mean(rollout_stats[k]) for k in rollout_stats }
-    avg_rollout_stats["Num_Success"] = np.sum(rollout_stats["Success_Rate"])
-    print("Average Rollout Stats")
-    print(json.dumps(avg_rollout_stats, indent=4))
+        rollout_stats_dict = TensorUtils.list_of_flat_dict_to_dict_of_list(rollout_stats)
+        avg_rollout_stats = { k : np.mean(rollout_stats_dict[k]) for k in rollout_stats_dict }
+        avg_rollout_stats["Num_Success"] = np.sum(rollout_stats_dict["Success_Rate"])
+        print("Average Rollout Stats")
+        print(json.dumps(avg_rollout_stats, indent=4))
 
     if write_video:
         video_writer.close()
@@ -316,7 +345,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_rollouts",
         type=int,
-        default=27,
+        default=1,
         help="number of rollouts",
     )
 
@@ -398,6 +427,19 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="(optional) path to tfm policy checkpoint",
+    )
+
+    parser.add_argument(
+        "--e2e_policy_cfg",
+        type=str,
+        default=None,
+        help="(optional) path to e2e policy checkpoint",
+    )
+
+    parser.add_argument(
+        "--use_wandb",
+        action="store_true",
+        help="use wandb to log rollouts",
     )
 
 
