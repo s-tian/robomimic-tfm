@@ -58,7 +58,8 @@ import imageio
 import numpy as np
 from copy import deepcopy
 import tqdm
-
+from omegaconf import DictConfig, OmegaConf
+import hydra
 import torch
 
 import robomimic
@@ -178,27 +179,22 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
     return stats, traj
 
 
-def run_trained_agent(args):
+@hydra.main(config_path="../../../tfm/tfm/configs", config_name="eval_config")
+def run_trained_agent(cfg):
     # some arg checking
-    write_video = (args.video_path is not None)
-    assert not (args.render and write_video) # either on-screen or video but not both
-    if args.render:
+    write_video = (cfg.rollout.video_path is not None)
+    assert not (cfg.rollout.render and write_video) # either on-screen or video but not both
+    if cfg.rollout.render:
         # on-screen rendering can only support one camera
-        assert len(args.camera_names) == 1
+        assert len(cfg.rollout.camera_names) == 1
 
     # device
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
 
     # restore policy
-    if args.tfm_policy_cfg is not None or args.e2e_policy_cfg is not None:
-        if args.tfm_policy_cfg is not None:
-            from tfm.models.robomimic_algo import TFMAlgo
-            policy = RolloutPolicy(TFMAlgo(args.tfm_policy_cfg, log_wandb=args.use_wandb))
-        elif args.e2e_policy_cfg is not None:
-            from tfm.models.robomimic_algo import E2ETFMAlgo
-            policy = RolloutPolicy(E2ETFMAlgo(args.e2e_policy_cfg, log_wandb=args.use_wandb))
-        else:
-            raise ValueError("Either tfm_policy_cfg or e2e_policy_cfg must be provided")
+    if cfg.target_class is not None:
+        target_class = hydra.utils.get_class(cfg.target_class)
+        policy = RolloutPolicy(target_class(cfg, log_wandb=cfg.use_wandb))
 
         robomimic_data_config = {
             "obs": {
@@ -217,18 +213,18 @@ def run_trained_agent(args):
         # train_dataset = get_dataset(cfg, "train")
         ObsUtils.initialize_obs_utils_with_obs_specs(robomimic_data_config)
     else:
-        policy, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=ckpt_path, device=device, verbose=True)
+        policy, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=cfg.ckpt_path, device=device, verbose=True)
 
     # read rollout settings
-    rollout_num_episodes = args.n_rollouts
-    rollout_horizon = args.horizon
+    rollout_num_episodes = cfg.rollout.n_rollouts
+    rollout_horizon = cfg.rollout.horizon
     if rollout_horizon is None:
         # read horizon from config
         config, _ = FileUtils.config_from_checkpoint(ckpt_dict=ckpt_dict)
         rollout_horizon = config.experiment.rollout.horizon
 
     # create environment from saved checkpoint
-    env_meta = FileUtils.get_env_metadata_from_dataset(args.env_dataset_path)
+    env_meta = FileUtils.get_env_metadata_from_dataset(cfg.rollout.env_dataset_path)
     controller_config = {
         'type': 'JOINT_POSITION', 
         'input_max': np.pi, 
@@ -248,6 +244,7 @@ def run_trained_agent(args):
     }
     env_meta['env_kwargs']['controller_configs']['body_parts']['right'] = controller_config
     env_meta["env_kwargs"]["camera_names"].remove("robot0_eye_in_hand")
+
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
         render=True, 
@@ -260,23 +257,23 @@ def run_trained_agent(args):
     env = FrameStackWrapper(env, num_frames=2)
 
     # maybe set seed
-    if args.seed is not None:
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
+    if cfg.rollout.seed is not None:
+        np.random.seed(cfg.rollout.seed)
+        torch.manual_seed(cfg.rollout.seed)
 
     # maybe create video writer
     video_writer = None
     if write_video:
-        video_writer = imageio.get_writer(args.video_path, fps=20)
+        video_writer = imageio.get_writer(cfg.rollout.video_path, fps=20)
 
     # maybe open hdf5 to write rollouts
-    write_dataset = (args.dataset_path is not None)
+    write_dataset = (cfg.rollout.dataset_path is not None)
     if write_dataset:
-        data_writer = h5py.File(args.dataset_path, "w")
+        data_writer = h5py.File(cfg.rollout.dataset_path, "w")
         data_grp = data_writer.create_group("data")
         total_samples = 0
 
-    if args.use_wandb:
+    if cfg.use_wandb:
         import wandb
         import datetime
         wandb.init(project="tfm-rollouts", name=datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
@@ -287,11 +284,11 @@ def run_trained_agent(args):
             policy=policy, 
             env=env, 
             horizon=rollout_horizon, 
-            render=args.render, 
+            render=cfg.rollout.render, 
             video_writer=video_writer, 
-            video_skip=args.video_skip, 
-            return_obs=(write_dataset and args.dataset_obs),
-            camera_names=args.camera_names,
+            video_skip=cfg.rollout.video_skip, 
+            return_obs=(write_dataset and cfg.rollout.dataset_obs),
+            camera_names=cfg.rollout.camera_names,
         )
         rollout_stats.append(stats)
 
@@ -302,7 +299,7 @@ def run_trained_agent(args):
             ep_data_grp.create_dataset("states", data=np.array(traj["states"]))
             ep_data_grp.create_dataset("rewards", data=np.array(traj["rewards"]))
             ep_data_grp.create_dataset("dones", data=np.array(traj["dones"]))
-            if args.dataset_obs:
+            if cfg.rollout.dataset_obs:
                 for k in traj["obs"]:
                     ep_data_grp.create_dataset("obs/{}".format(k), data=np.array(traj["obs"][k]))
                     ep_data_grp.create_dataset("next_obs/{}".format(k), data=np.array(traj["next_obs"][k]))
@@ -327,122 +324,8 @@ def run_trained_agent(args):
         data_grp.attrs["total"] = total_samples
         data_grp.attrs["env_args"] = json.dumps(env.serialize(), indent=4) # environment info
         data_writer.close()
-        print("Wrote dataset trajectories to {}".format(args.dataset_path))
+        print("Wrote dataset trajectories to {}".format(cfg.rollout.dataset_path))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-
-    # Path to trained model
-    parser.add_argument(
-        "--env_dataset_path",
-        type=str,
-        required=True,
-        help="path to the env dataset",
-    )
-
-    # number of rollouts
-    parser.add_argument(
-        "--n_rollouts",
-        type=int,
-        default=1,
-        help="number of rollouts",
-    )
-
-    # maximum horizon of rollout, to override the one stored in the model checkpoint
-    parser.add_argument(
-        "--horizon",
-        type=int,
-        default=None,
-        help="(optional) override maximum horizon of rollout from the one in the checkpoint",
-    )
-
-    # Env Name (to override the one stored in model checkpoint)
-    parser.add_argument(
-        "--env",
-        type=str,
-        default=None,
-        help="(optional) override name of env from the one in the checkpoint, and use\
-            it for rollouts",
-    )
-
-    # Whether to render rollouts to screen
-    parser.add_argument(
-        "--render",
-        action='store_true',
-        help="on-screen rendering",
-    )
-
-    # Dump a video of the rollouts to the specified path
-    parser.add_argument(
-        "--video_path",
-        type=str,
-        default=None,
-        help="(optional) render rollouts to this video file path",
-    )
-
-    # How often to write video frames during the rollout
-    parser.add_argument(
-        "--video_skip",
-        type=int,
-        default=5,
-        help="render frames to video every n steps",
-    )
-
-    # camera names to render
-    parser.add_argument(
-        "--camera_names",
-        type=str,
-        nargs='+',
-        default=["agentview"],
-        help="(optional) camera name(s) to use for rendering on-screen or to video",
-    )
-
-    # If provided, an hdf5 file will be written with the rollout data
-    parser.add_argument(
-        "--dataset_path",
-        type=str,
-        default=None,
-        help="(optional) if provided, an hdf5 file will be written at this path with the rollout data",
-    )
-
-    # If True and @dataset_path is supplied, will write possibly high-dimensional observations to dataset.
-    parser.add_argument(
-        "--dataset_obs",
-        action='store_true',
-        help="include possibly high-dimensional observations in output dataset hdf5 file (by default,\
-            observations are excluded and only simulator states are saved)",
-    )
-
-    # for seeding before starting rollouts
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="(optional) set seed for rollouts",
-    )
-
-    parser.add_argument(
-        "--tfm_policy_cfg",
-        type=str,
-        default=None,
-        help="(optional) path to tfm policy checkpoint",
-    )
-
-    parser.add_argument(
-        "--e2e_policy_cfg",
-        type=str,
-        default=None,
-        help="(optional) path to e2e policy checkpoint",
-    )
-
-    parser.add_argument(
-        "--use_wandb",
-        action="store_true",
-        help="use wandb to log rollouts",
-    )
-
-
-    args = parser.parse_args()
-    run_trained_agent(args)
-
+    run_trained_agent()
