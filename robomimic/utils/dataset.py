@@ -3,6 +3,7 @@ This file contains Dataset classes that are used by torch dataloaders
 to fetch batches from hdf5 files.
 """
 import os
+import json
 import h5py
 import numpy as np
 from copy import deepcopy
@@ -298,7 +299,7 @@ class SequenceDataset(torch.utils.data.Dataset):
                 all_data[ep]["attrs"]["model_file"] = hdf5_file["data/{}".format(ep)].attrs["model_file"]
 
             if "camera_info" in hdf5_file["data/{}".format(ep)].attrs:
-                all_data[ep]["attrs"]["camera_info"] = hdf5_file["data/{}".format(ep)].attrs["camera_info"]
+                all_data[ep]["attrs"]["camera_info"] = json.loads(hdf5_file["data/{}".format(ep)].attrs["camera_info"])
                 # print(all_data[ep]["attrs"]["camera_info"])
 
         return all_data
@@ -433,6 +434,7 @@ class SequenceDataset(torch.utils.data.Dataset):
             seq_length=self.seq_length
         )
 
+        meta["camera_info"] = self.hdf5_cache[demo_id]["attrs"]["camera_info"]
         # determine goal index
         goal_index = None
         if self.goal_mode == "last":
@@ -590,6 +592,7 @@ class SequenceDataset(torch.utils.data.Dataset):
             keys=self.obs_keys,
             seq_length=demo_length
         )
+
         if self.load_next_obs:
             meta["next_obs"] = self.get_obs_sequence_from_demo(
                 demo_id,

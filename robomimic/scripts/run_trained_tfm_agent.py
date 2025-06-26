@@ -195,20 +195,23 @@ def run_trained_agent(cfg):
     if cfg.target_class is not None:
         target_class = hydra.utils.get_class(cfg.target_class)
         policy = RolloutPolicy(target_class(cfg, log_wandb=cfg.use_wandb))
-
-        robomimic_data_config = {
-            "obs": {
-                "low_dim": [
-                    "robot0_eef_pos",
-                    "robot0_eef_quat_site",
-                    "robot0_joint_pos",
-                    "robot0_gripper_qpos",
-                ],
-                "rgb": ["agentview_image"],
-                "depth": ["agentview_depth"],
-                "scan": []
-            },
-        }
+        try:
+            robomimic_data_config = {"obs": policy.policy.tfm_cfg.data.obs_config}
+        except:
+            # use default
+            robomimic_data_config = {
+                "obs": {
+                    "low_dim": [
+                        "robot0_eef_pos",
+                        "robot0_eef_quat_site",
+                        "robot0_joint_pos",
+                        "robot0_gripper_qpos",
+                    ],
+                    "rgb": ["agentview_image"],
+                    "depth": ["agentview_depth"],
+                    "scan": []
+                },
+            }
         # init dataloader
         # train_dataset = get_dataset(cfg, "train")
         ObsUtils.initialize_obs_utils_with_obs_specs(robomimic_data_config)
