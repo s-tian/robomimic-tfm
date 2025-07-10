@@ -88,7 +88,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.hdf5_normalize_obs = hdf5_normalize_obs
         self._hdf5_file = None
 
-        assert hdf5_cache_mode in ["all", "low_dim", None]
+        assert hdf5_cache_mode in ["all", "all_nogetitem", "low_dim", None]
         self.hdf5_cache_mode = hdf5_cache_mode
 
         self.load_next_obs = load_next_obs
@@ -122,7 +122,7 @@ class SequenceDataset(torch.utils.data.Dataset):
             self.obs_normalization_stats = self.normalize_obs()
 
         # maybe store dataset in memory for fast access
-        if self.hdf5_cache_mode in ["all", "low_dim"]:
+        if self.hdf5_cache_mode in ["all", "all_nogetitem", "low_dim"]:
             obs_keys_in_memory = self.obs_keys
             if self.hdf5_cache_mode == "low_dim":
                 # only store low-dim observations
@@ -213,7 +213,9 @@ class SequenceDataset(torch.utils.data.Dataset):
         This property allows for a lazy hdf5 file open.
         """
         if self._hdf5_file is None:
+            print(f"Opening hdf5 file {self.hdf5_path}.")
             self._hdf5_file = h5py.File(self.hdf5_path, 'r', swmr=self.hdf5_use_swmr, libver='latest')
+            # self._hdf5_file = h5py.File(self.hdf5_path, 'r', swmr=self.hdf5_use_swmr, libver='latest')
         return self._hdf5_file
 
     def close_and_delete_hdf5_handle(self):
@@ -378,7 +380,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         """
 
         # check if this key should be in memory
-        key_should_be_in_memory = (self.hdf5_cache_mode in ["all", "low_dim"])
+        key_should_be_in_memory = (self.hdf5_cache_mode in ["all", "all_nogetitem", "low_dim"])
         if key_should_be_in_memory:
             # if key is an observation, it may not be in memory
             if '/' in key:

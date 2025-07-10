@@ -70,8 +70,9 @@ import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.env_utils as EnvUtils
 from robomimic.envs.env_base import EnvBase
 from robomimic.algo import RolloutPolicy
+from robomimic.scripts.dataset_states_to_obs import get_camera_info
 
-def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5, return_obs=False, camera_names=None):
+def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5, return_obs=False, camera_names=None, camera_heights=None, camera_widths=None):
     """
     Helper function to carry out rollouts. Supports on-screen rendering, off-screen rendering to a video, 
     and returns the rollout trajectory.
@@ -104,6 +105,18 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
     # hack that is necessary for robosuite tasks for deterministic action playback
     obs = env.reset_to(state_dict)
 
+    if EnvUtils.is_robosuite_env(env=env):
+        camera_info = get_camera_info(
+            env=env,
+            camera_names=camera_names, 
+            camera_height=camera_heights, 
+            camera_width=camera_widths,
+        )
+        for camera_name in camera_info.keys():
+            # convert the 'intrinsics' and 'extrinsics' keys to np arrays
+            for param_key in camera_info[camera_name].keys():
+                camera_info[camera_name][param_key] = np.array(camera_info[camera_name][param_key])
+
     results = {}
     video_count = 0  # video frame counter
     total_reward = 0.
@@ -113,7 +126,9 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
         traj.update(dict(obs=[], next_obs=[]))
     try:
         for step_i in tqdm.tqdm(range(horizon)):
-
+            
+            # add camera info
+            obs["camera_info"] = camera_info
             # get action from policy
             act = policy(ob=obs)
 
@@ -227,7 +242,7 @@ def run_trained_agent(cfg):
         rollout_horizon = config.experiment.rollout.horizon
 
     # create environment from saved checkpoint
-    env_meta = FileUtils.get_env_metadata_from_dataset(cfg.rollout.env_dataset_path)
+    env_meta = FileUtils.get_env_metadata_from_dataset(cfg.data.hdf5_path)
     controller_config = {
         'type': 'JOINT_POSITION', 
         'input_max': np.pi, 
@@ -246,7 +261,7 @@ def run_trained_agent(cfg):
         'gripper': {'type': 'GRIP'},
     }
     env_meta['env_kwargs']['controller_configs']['body_parts']['right'] = controller_config
-    env_meta["env_kwargs"]["camera_names"].remove("robot0_eye_in_hand")
+    # env_meta["env_kwargs"]["camera_names"].remove("robot0_eye_in_hand")
 
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
@@ -280,7 +295,6 @@ def run_trained_agent(cfg):
         import wandb
         import datetime
         wandb.init(project="tfm-rollouts", name=datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-
     rollout_stats = []
     for i in range(rollout_num_episodes):
         stats, traj = rollout(
@@ -292,6 +306,8 @@ def run_trained_agent(cfg):
             video_skip=cfg.rollout.video_skip, 
             return_obs=(write_dataset and cfg.rollout.dataset_obs),
             camera_names=cfg.rollout.camera_names,
+            camera_heights=env_meta['env_kwargs']['camera_heights'],
+            camera_widths=env_meta['env_kwargs']['camera_widths'],
         )
         rollout_stats.append(stats)
 
