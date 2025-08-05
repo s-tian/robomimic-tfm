@@ -15,6 +15,19 @@ import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.log_utils as LogUtils
 
+def convert_camera_info_to_dict_of_lists(camera_info):
+    # camera_info has the following structure:
+    # [{cam_name_1: {intrinsics: [...], extrinsics: [...], ...}}, {cam_name_2: {intrinsics: [...], extrinsics: [...], ...}}, ...]
+    # convert to {cam_name_1: {intrinsics: [...], extrinsics: [...], ...}, cam_name_2: {intrinsics: [...], extrinsics: [...], ...}, ...}
+    # Assume all frames have the same camera keys and keys per camera
+    cams = camera_info[0].keys()
+    out = {}
+    for cam in cams:
+        out[cam] = {}
+        for k in camera_info[0][cam]:
+            out[cam][k] = [frame[cam][k] for frame in camera_info]
+    return out
+
 
 class SequenceDataset(torch.utils.data.Dataset):
     def __init__(
@@ -435,8 +448,19 @@ class SequenceDataset(torch.utils.data.Dataset):
             num_frames_to_stack=self.n_frame_stack - 1, # note: need to decrement self.n_frame_stack by one
             seq_length=self.seq_length
         )
+        meta["camera_info"] = self.hdf5_cache[demo_id]["attrs"]["camera_info"][index_in_demo:index_in_demo+self.seq_length]
+        # camera_info is a list of dicts of dicts, convert it to a dict of dicts of lists
+        meta["camera_info"] = convert_camera_info_to_dict_of_lists(meta["camera_info"])
 
-        meta["camera_info"] = self.hdf5_cache[demo_id]["attrs"]["camera_info"]
+        # pad camera_info to the same length as the sequence if needed
+        for cam in meta["camera_info"]:
+            for k in meta["camera_info"][cam]:
+                # pad by repeating the last element if needed
+                if len(meta["camera_info"][cam][k]) < self.seq_length:
+                    last_elem = meta["camera_info"][cam][k][-1]
+                    num_to_pad = self.seq_length - len(meta["camera_info"][cam][k])
+                    meta["camera_info"][cam][k].extend([last_elem] * num_to_pad)
+
         # determine goal index
         goal_index = None
         if self.goal_mode == "last":

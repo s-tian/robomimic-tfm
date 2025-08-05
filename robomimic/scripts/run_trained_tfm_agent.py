@@ -58,7 +58,7 @@ import imageio
 import numpy as np
 from copy import deepcopy
 import tqdm
-from omegaconf import DictConfig, OmegaConf
+import omegaconf
 import hydra
 import torch
 
@@ -72,6 +72,12 @@ from robomimic.envs.env_base import EnvBase
 from robomimic.algo import RolloutPolicy
 from robomimic.scripts.dataset_states_to_obs import get_camera_info
 
+from tfm.models.utils.rotation_transformer import RotationTransformer
+
+rotation_converter = RotationTransformer(from_rep='axis_angle', to_rep='rotation_6d')
+
+TASK_ID = 1
+
 def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5, return_obs=False, camera_names=None, camera_heights=None, camera_widths=None):
     """
     Helper function to carry out rollouts. Supports on-screen rendering, off-screen rendering to a video, 
@@ -84,7 +90,7 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
         render (bool): whether to render rollout on-screen
         video_writer (imageio writer): if provided, use to write rollout to video
         video_skip (int): how often to write video frames
-        return_obs (bool): if True, return possibly high-dimensional observations along the trajectoryu. 
+        return_obs (bool): if True, return possibly high-dimensional observations along the trajectory. 
             They are excluded by default because the low-dimensional simulation states should be a minimal 
             representation of the environment. 
         camera_names (list): determines which camera(s) are used for rendering. Pass more than
@@ -105,18 +111,6 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
     # hack that is necessary for robosuite tasks for deterministic action playback
     obs = env.reset_to(state_dict)
 
-    if EnvUtils.is_robosuite_env(env=env):
-        camera_info = get_camera_info(
-            env=env,
-            camera_names=camera_names, 
-            camera_height=camera_heights, 
-            camera_width=camera_widths,
-        )
-        for camera_name in camera_info.keys():
-            # convert the 'intrinsics' and 'extrinsics' keys to np arrays
-            for param_key in camera_info[camera_name].keys():
-                camera_info[camera_name][param_key] = np.array(camera_info[camera_name][param_key])
-
     results = {}
     video_count = 0  # video frame counter
     total_reward = 0.
@@ -126,11 +120,29 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
         traj.update(dict(obs=[], next_obs=[]))
     try:
         for step_i in tqdm.tqdm(range(horizon)):
-            
+            if EnvUtils.is_robosuite_env(env=env):
+                camera_info = get_camera_info(
+                    env=env,
+                    camera_names=camera_names, 
+                    camera_height=camera_heights, 
+                    camera_width=camera_widths,
+                )
+                for camera_name in camera_info.keys():
+                    # convert the 'intrinsics' and 'extrinsics' keys to np arrays
+                    for param_key in camera_info[camera_name].keys():
+                        camera_info[camera_name][param_key] = np.array(camera_info[camera_name][param_key])
+                    
             # add camera info
             obs["camera_info"] = camera_info
+            num_tasks = len(policy.policy.cfg.data)
+            obs["task_encoding"] = torch.nn.functional.one_hot(torch.tensor(TASK_ID), num_tasks).float().numpy()
             # get action from policy
             act = policy(ob=obs)
+            if "rot6d" in policy.policy.cfg.model and policy.policy.cfg.model.rot6d and policy.policy.cfg.model.predict_ee_actions:
+            # if True:
+                rot = act[..., 3:9]
+                rot = rotation_converter.inverse(rot)
+                act = np.concatenate([act[..., :3], rot, act[..., 9:]], axis=-1)
 
             # play action
             next_obs, r, done, _ = env.step(act)
@@ -206,13 +218,66 @@ def run_trained_agent(cfg):
     # device
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
 
+    # read rollout settings
+    rollout_num_episodes = cfg.rollout.n_rollouts
+    rollout_horizon = cfg.rollout.horizon
+    if rollout_horizon is None:
+        # read horizon from config
+        config, _ = FileUtils.config_from_checkpoint(ckpt_dict=ckpt_dict)
+        rollout_horizon = config.experiment.rollout.horizon
+
+    # create environment from saved checkpoint
+    env_meta = FileUtils.get_env_metadata_from_dataset(cfg.data.hdf5_path)
+    ### Uncomment for joint position control
+    controller_config = {
+        'type': 'JOINT_POSITION', 
+        'input_max': np.pi, 
+        'input_min': -np.pi, 
+        'output_max': np.pi, 
+        'output_min': -np.pi, 
+        'kp': 50, 
+        'damping_ratio': 1, 
+        'input_type': 'absolute',
+        'impedance_mode': 'fixed', 
+        'kp_limits': [0, 300], 
+        'damping_ratio_limits': [0, 10], 
+        'qpos_limits': None, 
+        'interpolation': None, 
+        'ramp_ratio': 0.2,
+        'gripper': {'type': 'GRIP'},
+    }
+    env_meta['env_kwargs']['controller_configs']['body_parts']['right'] = controller_config
+    ### End uncomment for joint position control
+    # env_meta['env_kwargs']['controller_configs']['body_parts']['right']['input_type'] = 'absolute'
+
+    # env_meta["env_kwargs"]["camera_names"].remove("robot0_eye_in_hand")
+
+    env = EnvUtils.create_env_from_metadata(
+        env_meta=env_meta,
+        render=True, 
+        render_offscreen=True,
+        use_image_obs=env_meta["env_kwargs"].get("use_camera_obs", False), 
+        use_depth_obs=env_meta["env_kwargs"].get("camera_depths", False),
+    ) 
+    omegaconf.OmegaConf.update(cfg, "data.data0.image_resolution", env_meta["env_kwargs"]["camera_heights"], force_add=True)
+
+    from robomimic.envs.wrappers import FrameStackWrapper
+    env = FrameStackWrapper(env, num_frames=2)
+
     # restore policy
     if cfg.target_class is not None:
         target_class = hydra.utils.get_class(cfg.target_class)
         policy = RolloutPolicy(target_class(cfg, log_wandb=cfg.use_wandb))
+        from tfm.models.robomimic_algo import E2ETFMAlgo, TFMAlgo
         try:
-            robomimic_data_config = {"obs": policy.policy.tfm_cfg.data.obs_config}
+            if isinstance(policy.policy, E2ETFMAlgo):
+                robomimic_data_config = {"obs": policy.policy.e2e_policy.cfg.data.data0.obs_config}
+            elif isinstance(policy.policy, TFMAlgo):
+                robomimic_data_config = {"obs": policy.policy.tfm_policy.cfg.data.data0.obs_config}
+            else:
+                robomimic_data_config = {"obs": policy.policy.cfg.data.data0.obs_config}
         except:
+            print("Defaulting on robomimic data config")
             # use default
             robomimic_data_config = {
                 "obs": {
@@ -233,46 +298,8 @@ def run_trained_agent(cfg):
     else:
         policy, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=cfg.ckpt_path, device=device, verbose=True)
 
-    # read rollout settings
-    rollout_num_episodes = cfg.rollout.n_rollouts
-    rollout_horizon = cfg.rollout.horizon
-    if rollout_horizon is None:
-        # read horizon from config
-        config, _ = FileUtils.config_from_checkpoint(ckpt_dict=ckpt_dict)
-        rollout_horizon = config.experiment.rollout.horizon
-
-    # create environment from saved checkpoint
-    env_meta = FileUtils.get_env_metadata_from_dataset(cfg.data.hdf5_path)
-    controller_config = {
-        'type': 'JOINT_POSITION', 
-        'input_max': np.pi, 
-        'input_min': -np.pi, 
-        'output_max': np.pi, 
-        'output_min': -np.pi, 
-        'kp': 50, 
-        'damping_ratio': 1, 
-        'input_type': 'absolute',
-        'impedance_mode': 'fixed', 
-        'kp_limits': [0, 300], 
-        'damping_ratio_limits': [0, 10], 
-        'qpos_limits': None, 
-        'interpolation': None, 
-        'ramp_ratio': 0.2,
-        'gripper': {'type': 'GRIP'},
-    }
-    env_meta['env_kwargs']['controller_configs']['body_parts']['right'] = controller_config
-    # env_meta["env_kwargs"]["camera_names"].remove("robot0_eye_in_hand")
-
-    env = EnvUtils.create_env_from_metadata(
-        env_meta=env_meta,
-        render=True, 
-        render_offscreen=True,
-        use_image_obs=env_meta["env_kwargs"].get("use_camera_obs", False), 
-        use_depth_obs=env_meta["env_kwargs"].get("camera_depths", False),
-    ) 
-
-    from robomimic.envs.wrappers import FrameStackWrapper
-    env = FrameStackWrapper(env, num_frames=2)
+    global TASK_ID
+    TASK_ID = cfg.rollout.task_id
 
     # maybe set seed
     if cfg.rollout.seed is not None:

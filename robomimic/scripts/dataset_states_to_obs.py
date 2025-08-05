@@ -94,6 +94,19 @@ def extract_trajectory(
     # maybe add in intrinsics and extrinsics for all cameras
     camera_info = None
     is_robosuite_env = EnvUtils.is_robosuite_env(env=env)
+   
+
+    traj = dict(
+        obs=[], 
+        next_obs=[], 
+        rewards=[], 
+        dones=[], 
+        camera_info=[],
+        actions=np.array(actions), 
+        states=np.array(states), 
+        initial_state_dict=initial_state,
+    )
+
     if is_robosuite_env:
         camera_info = get_camera_info(
             env=env,
@@ -101,16 +114,6 @@ def extract_trajectory(
             camera_height=camera_height, 
             camera_width=camera_width,
         )
-
-    traj = dict(
-        obs=[], 
-        next_obs=[], 
-        rewards=[], 
-        dones=[], 
-        actions=np.array(actions), 
-        states=np.array(states), 
-        initial_state_dict=initial_state,
-    )
     traj_len = states.shape[0]
     # iteration variable @t is over "next obs" indices
     for t in range(1, traj_len + 1):
@@ -143,6 +146,15 @@ def extract_trajectory(
         traj["next_obs"].append(next_obs)
         traj["rewards"].append(r)
         traj["dones"].append(done)
+        traj["camera_info"].append(camera_info)
+        if is_robosuite_env:
+            # grab new camera info for next obs
+            camera_info = get_camera_info(
+                env=env,
+                camera_names=camera_names, 
+                camera_height=camera_height, 
+                camera_width=camera_width,
+            )
 
         # update for next iter
         obs = deepcopy(next_obs)
@@ -155,13 +167,15 @@ def extract_trajectory(
     for k in traj:
         if k == "initial_state_dict":
             continue
+        if k == "camera_info":
+            continue
         if isinstance(traj[k], dict):
             for kp in traj[k]:
                 traj[k][kp] = np.array(traj[k][kp])
         else:
             traj[k] = np.array(traj[k])
 
-    return traj, camera_info
+    return traj, traj["camera_info"]
 
 
 def get_camera_info(
@@ -188,25 +202,25 @@ def get_camera_info(
     for cam_name in camera_names:
         K = env.get_camera_intrinsic_matrix(camera_name=cam_name, camera_height=camera_height, camera_width=camera_width)
         R = env.get_camera_extrinsic_matrix(camera_name=cam_name) # camera pose in world frame
-        if "eye_in_hand" in cam_name:
-            # convert extrinsic matrix to be relative to robot eef control frame
-            assert cam_name.startswith("robot0") or cam_name.startswith("robot1")
-            robot_ind = int(cam_name[5])
-            if is_v15:
-                eef_site_name = env.base_env.robots[robot_ind].composite_controller.part_controllers["right"].ref_name
-            else:
-                eef_site_name = env.base_env.robots[robot_ind].controller.eef_name
-            eef_pos = np.array(env.base_env.sim.data.site_xpos[env.base_env.sim.model.site_name2id(eef_site_name)])
-            eef_rot = np.array(env.base_env.sim.data.site_xmat[env.base_env.sim.model.site_name2id(eef_site_name)].reshape([3, 3]))
-            eef_pose = np.zeros((4, 4)) # eef pose in world frame
-            eef_pose[:3, :3] = eef_rot
-            eef_pose[:3, 3] = eef_pos
-            eef_pose[3, 3] = 1.0
-            eef_pose_inv = np.zeros((4, 4))
-            eef_pose_inv[:3, :3] = eef_pose[:3, :3].T
-            eef_pose_inv[:3, 3] = -eef_pose_inv[:3, :3].dot(eef_pose[:3, 3])
-            eef_pose_inv[3, 3] = 1.0
-            R = R.dot(eef_pose_inv) # T_E^W * T_W^C = T_E^C
+        # if "eye_in_hand" in cam_name:
+        #     # convert extrinsic matrix to be relative to robot eef control frame
+        #     assert cam_name.startswith("robot0") or cam_name.startswith("robot1")
+        #     robot_ind = int(cam_name[5])
+        #     if is_v15:
+        #         eef_site_name = env.base_env.robots[robot_ind].composite_controller.part_controllers["right"].ref_name
+        #     else:
+        #         eef_site_name = env.base_env.robots[robot_ind].controller.eef_name
+        #     eef_pos = np.array(env.base_env.sim.data.site_xpos[env.base_env.sim.model.site_name2id(eef_site_name)])
+        #     eef_rot = np.array(env.base_env.sim.data.site_xmat[env.base_env.sim.model.site_name2id(eef_site_name)].reshape([3, 3]))
+        #     eef_pose = np.zeros((4, 4)) # eef pose in world frame
+        #     eef_pose[:3, :3] = eef_rot
+        #     eef_pose[:3, 3] = eef_pos
+        #     eef_pose[3, 3] = 1.0
+        #     eef_pose_inv = np.zeros((4, 4))
+        #     eef_pose_inv[:3, :3] = eef_pose[:3, :3].T
+        #     eef_pose_inv[:3, 3] = -eef_pose_inv[:3, :3].dot(eef_pose[:3, 3])
+        #     eef_pose_inv[3, 3] = 1.0
+        #     R = R.dot(eef_pose_inv) # T_E^W * T_W^C = T_E^C
         camera_info[cam_name] = dict(
             intrinsics=K.tolist(),
             extrinsics=R.tolist(),
@@ -217,7 +231,6 @@ def get_camera_info(
 def dataset_states_to_obs(args):
     if args.depth:
         assert len(args.camera_names) > 0, "must specify camera names if using depth"
-
     # create environment to use for data processing
     env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=args.dataset)
     env = EnvUtils.create_env_for_data_processing(
@@ -305,6 +318,7 @@ def dataset_states_to_obs(args):
         # episode metadata
         if is_robosuite_env:
             ep_data_grp.attrs["model_file"] = traj["initial_state_dict"]["model"] # model xml for this episode
+            pass
         ep_data_grp.attrs["num_samples"] = traj["actions"].shape[0] # number of transitions in this episode
 
         if camera_info is not None:
