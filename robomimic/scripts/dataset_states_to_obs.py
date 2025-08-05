@@ -33,6 +33,10 @@ Example usage:
     python dataset_states_to_obs.py --dataset /path/to/demo.hdf5 --output_name image.hdf5 \
         --done_mode 2 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84
 
+    # extract 84x84 image and depth observations
+    python dataset_states_to_obs.py --dataset /path/to/demo.hdf5 --output_name depth.hdf5 \
+        --done_mode 2 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84 --depth
+
     # (space saving option) extract 84x84 image observations with compression and without 
     # extracting next obs (not needed for pure imitation learning algos)
     python dataset_states_to_obs.py --dataset /path/to/demo.hdf5 --output_name image.hdf5 \
@@ -49,6 +53,7 @@ import h5py
 import argparse
 import numpy as np
 from copy import deepcopy
+from tqdm import tqdm
 
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.file_utils as FileUtils
@@ -62,6 +67,9 @@ def extract_trajectory(
     states, 
     actions,
     done_mode,
+    camera_names=None, 
+    camera_height=84, 
+    camera_width=84,
 ):
     """
     Helper function to extract observations, rewards, and dones along a trajectory using
@@ -231,6 +239,7 @@ def dataset_states_to_obs(args):
         camera_height=args.camera_height, 
         camera_width=args.camera_width, 
         reward_shaping=args.shaped,
+        use_depth_obs=args.depth,
     )
 
     print("==== Using environment with the following metadata ====")
@@ -258,7 +267,7 @@ def dataset_states_to_obs(args):
     print("output file: {}".format(output_path))
 
     total_samples = 0
-    for ind in range(len(demos)):
+    for ind in tqdm(range(len(demos))):
         ep = demos[ind]
 
         # prepare initial state to reload from
@@ -269,12 +278,15 @@ def dataset_states_to_obs(args):
 
         # extract obs, rewards, dones
         actions = f["data/{}/actions".format(ep)][()]
-        traj = extract_trajectory(
+        traj, camera_info = extract_trajectory(
             env=env, 
             initial_state=initial_state, 
             states=states, 
             actions=actions,
             done_mode=args.done_mode,
+            camera_names=args.camera_names, 
+            camera_height=args.camera_height, 
+            camera_width=args.camera_width,
         )
 
         # maybe copy reward or done signal from source file
@@ -308,8 +320,12 @@ def dataset_states_to_obs(args):
             ep_data_grp.attrs["model_file"] = traj["initial_state_dict"]["model"] # model xml for this episode
             pass
         ep_data_grp.attrs["num_samples"] = traj["actions"].shape[0] # number of transitions in this episode
+
+        if camera_info is not None:
+            assert is_robosuite_env
+            ep_data_grp.attrs["camera_info"] = json.dumps(camera_info, indent=4)
+
         total_samples += traj["actions"].shape[0]
-        print("ep {}: wrote {} transitions to group {}".format(ind, ep_data_grp.attrs["num_samples"], ep))
 
 
     # copy over all filter keys that exist in the original hdf5
@@ -378,6 +394,13 @@ if __name__ == "__main__":
         type=int,
         default=84,
         help="(optional) width of image observations",
+    )
+
+    # flag for including depth observations per camera
+    parser.add_argument(
+        "--depth", 
+        action='store_true',
+        help="(optional) use depth observations for each camera",
     )
 
     # specifies how the "done" signal is written. If "0", then the "done" signal is 1 wherever 

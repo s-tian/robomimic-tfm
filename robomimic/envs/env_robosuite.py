@@ -7,8 +7,8 @@ import json
 import numpy as np
 from copy import deepcopy
 
-import mujoco_py
 import robosuite
+import robosuite.utils.transform_utils as T
 
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.envs.env_base as EB
@@ -298,6 +298,81 @@ class EnvRobosuite(EB.EnvBase):
             type=self.type,
             env_kwargs=deepcopy(self._init_kwargs)
         )
+    
+    def get_real_depth_map(self, depth_map):
+        """
+        Reproduced from https://github.com/ARISE-Initiative/robosuite/blob/c57e282553a4f42378f2635b9a3cbc4afba270fd/robosuite/utils/camera_utils.py#L106
+        since older versions of robosuite do not have this conversion from normalized depth values returned by MuJoCo
+        to real depth values.
+        """
+        # Make sure that depth values are normalized
+        assert np.all(depth_map >= 0.0) and np.all(depth_map <= 1.0)
+        extent = self.env.sim.model.stat.extent
+        far = self.env.sim.model.vis.map.zfar * extent
+        near = self.env.sim.model.vis.map.znear * extent
+        return near / (1.0 - depth_map * (1.0 - near / far))
+
+    def get_camera_intrinsic_matrix(self, camera_name, camera_height, camera_width):
+        """
+        Obtains camera intrinsic matrix.
+        Args:
+            camera_name (str): name of camera
+            camera_height (int): height of camera images in pixels
+            camera_width (int): width of camera images in pixels
+        Return:
+            K (np.array): 3x3 camera matrix
+        """
+        cam_id = self.env.sim.model.camera_name2id(camera_name)
+        fovy = self.env.sim.model.cam_fovy[cam_id]
+        f = 0.5 * camera_height / np.tan(fovy * np.pi / 360)
+        K = np.array([[f, 0, camera_width / 2], [0, f, camera_height / 2], [0, 0, 1]])
+        return K
+
+    def get_camera_extrinsic_matrix(self, camera_name):
+        """
+        Returns a 4x4 homogenous matrix corresponding to the camera pose in the
+        world frame. MuJoCo has a weird convention for how it sets up the
+        camera body axis, so we also apply a correction so that the x and y
+        axis are along the camera view and the z axis points along the
+        viewpoint.
+        Normal camera convention: https://docs.opencv.org/2.4/modules/calib3d/doc/camera_calibration_and_3d_reconstruction.html
+        Args:
+            camera_name (str): name of camera
+        Return:
+            R (np.array): 4x4 camera extrinsic matrix
+        """
+        cam_id = self.env.sim.model.camera_name2id(camera_name)
+        camera_pos = self.env.sim.data.cam_xpos[cam_id]
+        camera_rot = self.env.sim.data.cam_xmat[cam_id].reshape(3, 3)
+        R = T.make_pose(camera_pos, camera_rot)
+
+        # IMPORTANT! This is a correction so that the camera axis is set up along the viewpoint correctly.
+        camera_axis_correction = np.array(
+            [[1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+        )
+        R = R @ camera_axis_correction
+        return R
+
+    def get_camera_transform_matrix(self, camera_name, camera_height, camera_width):
+        """
+        Camera transform matrix to project from world coordinates to pixel coordinates.
+        Args:
+            camera_name (str): name of camera
+            camera_height (int): height of camera images in pixels
+            camera_width (int): width of camera images in pixels
+        Return:
+            K (np.array): 4x4 camera matrix to project from world coordinates to pixel coordinates
+        """
+        R = self.get_camera_extrinsic_matrix(camera_name=camera_name)
+        K = self.get_camera_intrinsic_matrix(
+            camera_name=camera_name, camera_height=camera_height, camera_width=camera_width
+        )
+        K_exp = np.eye(4)
+        K_exp[:3, :3] = K
+
+        # Takes a point in world, transforms to camera frame, and then projects onto image plane.
+        return K_exp @ T.pose_inv(R)
+
 
     @classmethod
     def create_for_data_processing(
