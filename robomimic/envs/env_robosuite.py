@@ -10,6 +10,12 @@ from copy import deepcopy
 import robosuite
 import robosuite.utils.transform_utils as T
 
+try:
+    # this is needed for ensuring robosuite can find the additional mimicgen environments (see https://mimicgen.github.io)
+    import mimicgen
+except ImportError:
+    pass
+
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.envs.env_base as EB
 
@@ -59,7 +65,7 @@ class EnvRobosuite(EB.EnvBase):
             ignore_done=True,
             use_object_obs=True,
             use_camera_obs=use_image_obs,
-            camera_depths=False,
+            camera_depths=kwargs.get("camera_depths", False),
         )
         kwargs.update(update_kwargs)
 
@@ -190,6 +196,28 @@ class EnvRobosuite(EB.EnvBase):
                 ret[k] = di[k][::-1]
                 if self.postprocess_visual_obs:
                     ret[k] = ObsUtils.process_obs(obs=ret[k], obs_key=k)
+            # Save the image to file for debugging
+                # import imageio
+                # imageio.imwrite(f"debug_{k}.png", ret[k])
+            if (k in ObsUtils.OBS_KEYS_TO_MODALITIES) and ObsUtils.key_is_obs_modality(key=k, obs_modality="depth"):
+                ret[k] = self.get_real_depth_map(di[k])
+                # the depth map is flipped on the y-axis, so we need to flip it back
+                ret[k] = ret[k][::-1]
+                # Save the depth map to file for debugging
+                # import imageio
+                # # If the depth map is single channel, expand to 3 channels for saving
+                # depth_img = ret[k]
+                # depth_img = np.concatenate([depth_img]*3, axis=-1)
+                # # Normalize depth map to [0, 255] and convert to uint8 for saving
+                # depth_min = np.min(depth_img)
+                # depth_max = np.max(depth_img)
+                # if depth_max > depth_min:
+                #     norm_depth = (depth_img - depth_min) / (depth_max - depth_min)
+                # else:
+                #     norm_depth = np.zeros_like(depth_img)
+                # norm_depth_uint8 = (norm_depth * 255).astype(np.uint8)
+                # imageio.imwrite(f"debug_{k}_depth.png", norm_depth_uint8)
+            
 
         # "object" key contains object information
         ret["object"] = np.array(di["object-state"])
@@ -417,6 +445,9 @@ class EnvRobosuite(EB.EnvBase):
 
         kwargs.update(new_kwargs)
 
+        if "camera_depths" in kwargs:
+            kwargs["camera_depths"] = kwargs["camera_depths"]
+
         # also initialize obs utils so it knows which modalities are image modalities
         image_modalities = list(camera_names)
         if is_v1:
@@ -425,10 +456,15 @@ class EnvRobosuite(EB.EnvBase):
             # v0.3 only had support for one image, and it was named "rgb"
             assert len(image_modalities) == 1
             image_modalities = ["rgb"]
+        
+        if "camera_depths" in kwargs:
+            depth_modalities = ["{}_depth".format(cn) for cn in camera_names]
+
         obs_modality_specs = {
             "obs": {
                 "low_dim": [], # technically unused, so we don't have to specify all of them
                 "rgb": image_modalities,
+                "depth": depth_modalities,
             }
         }
         ObsUtils.initialize_obs_utils_with_obs_specs(obs_modality_specs)

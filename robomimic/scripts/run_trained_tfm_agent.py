@@ -61,6 +61,7 @@ import tqdm
 import omegaconf
 import hydra
 import torch
+import random
 
 import robomimic
 import robomimic.utils.file_utils as FileUtils
@@ -229,32 +230,34 @@ def run_trained_agent(cfg):
     # create environment from saved checkpoint
     env_meta = FileUtils.get_env_metadata_from_dataset(cfg.data.hdf5_path)
     ### Uncomment for joint position control
-    controller_config = {
-        'type': 'JOINT_POSITION', 
-        'input_max': np.pi, 
-        'input_min': -np.pi, 
-        'output_max': np.pi, 
-        'output_min': -np.pi, 
-        'kp': 50, 
-        'damping_ratio': 1, 
-        'input_type': 'absolute',
-        'impedance_mode': 'fixed', 
-        'kp_limits': [0, 300], 
-        'damping_ratio_limits': [0, 10], 
-        'qpos_limits': None, 
-        'interpolation': None, 
-        'ramp_ratio': 0.2,
-        'gripper': {'type': 'GRIP'},
-    }
-    env_meta['env_kwargs']['controller_configs']['body_parts']['right'] = controller_config
+    # controller_config = {
+    #     'type': 'JOINT_POSITION', 
+    #     'input_max': np.pi, 
+    #     'input_min': -np.pi, 
+    #     'output_max': np.pi, 
+    #     'output_min': -np.pi, 
+    #     'kp': 50, 
+    #     'damping_ratio': 1, 
+    #     'input_type': 'absolute',
+    #     'impedance_mode': 'fixed', 
+    #     'kp_limits': [0, 300], 
+    #     'damping_ratio_limits': [0, 10], 
+    #     'qpos_limits': None, 
+    #     'interpolation': None, 
+    #     'ramp_ratio': 0.2,
+    #     'gripper': {'type': 'GRIP'},
+    # }
+    # env_meta['env_kwargs']['controller_configs'] = controller_config
+    # env_meta['env_kwargs']['controller_configs']['body_parts']['right'] = controller_config
     ### End uncomment for joint position control
     # env_meta['env_kwargs']['controller_configs']['body_parts']['right']['input_type'] = 'absolute'
+    env_meta['env_kwargs']['controller_configs']['control_delta'] = False
+    # breakpoint()
 
     # env_meta["env_kwargs"]["camera_names"].remove("robot0_eye_in_hand")
-
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
-        render=True, 
+        render=False, 
         render_offscreen=True,
         use_image_obs=env_meta["env_kwargs"].get("use_camera_obs", False), 
         use_depth_obs=env_meta["env_kwargs"].get("camera_depths", False),
@@ -267,7 +270,7 @@ def run_trained_agent(cfg):
     # restore policy
     if cfg.target_class is not None:
         target_class = hydra.utils.get_class(cfg.target_class)
-        policy = RolloutPolicy(target_class(cfg, log_wandb=cfg.use_wandb))
+        policy = RolloutPolicy(target_class(cfg, log_wandb=cfg.use_wandb, log_verbose=cfg.log_verbose))
         from tfm.models.robomimic_algo import E2ETFMAlgo, TFMAlgo
         try:
             if isinstance(policy.policy, E2ETFMAlgo):
@@ -304,6 +307,7 @@ def run_trained_agent(cfg):
     # maybe set seed
     if cfg.rollout.seed is not None:
         np.random.seed(cfg.rollout.seed)
+        random.seed(cfg.rollout.seed)
         torch.manual_seed(cfg.rollout.seed)
 
     # maybe create video writer
@@ -371,6 +375,8 @@ def run_trained_agent(cfg):
         data_grp.attrs["env_args"] = json.dumps(env.serialize(), indent=4) # environment info
         data_writer.close()
         print("Wrote dataset trajectories to {}".format(cfg.rollout.dataset_path))
+
+    env.env.env.close()
 
 
 if __name__ == "__main__":

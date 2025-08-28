@@ -173,10 +173,10 @@ def create_env(
     env_class = get_env_class(env_type=env_type)
     env = env_class(
         env_name=env_name, 
-        render=render, 
-        render_offscreen=render_offscreen, 
+        has_renderer=render, 
+        has_offscreen_renderer=render_offscreen, 
         use_image_obs=use_image_obs,
-        use_depth_obs=use_depth_obs,
+        camera_depths=use_depth_obs,
         postprocess_visual_obs=True,
         **kwargs,
     )
@@ -225,6 +225,10 @@ def create_env_from_metadata(
         env_name = env_meta["env_name"]
     env_type = get_env_type(env_meta=env_meta)
     env_kwargs = env_meta["env_kwargs"]
+    env_kwargs.pop("has_renderer", None)
+    env_kwargs.pop("has_offscreen_renderer", None)
+    env_kwargs.pop("use_camera_obs", None)
+    env_kwargs.pop("camera_depths", None)
 
     env = create_env(
         env_type=env_type,
@@ -292,11 +296,10 @@ def create_env_for_data_processing(
     env_kwargs.pop("camera_height", None)
     env_kwargs.pop("camera_width", None)
     env_kwargs.pop("reward_shaping", None)
-    env_kwargs.pop("render", None)
-    env_kwargs.pop("render_offscreen", None)
+    env_kwargs.pop("has_renderer", None)
+    env_kwargs.pop("has_offscreen_renderer", None)
     env_kwargs.pop("use_image_obs", None)
-    env_kwargs.pop("use_depth_obs", None)
-
+    env_kwargs.pop("camera_depths", None)
 
     env = env_class.create_for_data_processing(
         env_name=env_name, 
@@ -304,10 +307,10 @@ def create_env_for_data_processing(
         camera_height=camera_height, 
         camera_width=camera_width, 
         reward_shaping=reward_shaping, 
-        # render=render, 
-        # render_offscreen=render_offscreen, 
+        has_renderer=render, 
+        has_offscreen_renderer=render_offscreen, 
         # use_image_obs=use_image_obs, 
-        # use_depth_obs=use_depth_obs,
+        camera_depths=use_depth_obs,
         **env_kwargs,
     )
     check_env_version(env, env_meta)
