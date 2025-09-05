@@ -228,7 +228,10 @@ def run_trained_agent(cfg):
         rollout_horizon = config.experiment.rollout.horizon
 
     # create environment from saved checkpoint
-    env_meta = FileUtils.get_env_metadata_from_dataset(cfg.data.hdf5_path)
+    try:
+        env_meta = FileUtils.get_env_metadata_from_dataset(cfg.data.hdf5_path)
+    except:
+        env_meta = FileUtils.get_env_metadata_from_dataset(cfg.data.zarr_path)
     ### Uncomment for joint position control
     # controller_config = {
     #     'type': 'JOINT_POSITION', 
