@@ -46,6 +46,8 @@ class SequenceDataset(torch.utils.data.Dataset):
         hdf5_normalize_obs=False,
         filter_by_attribute=None,
         load_next_obs=True,
+        materialize_to_local=False,
+        local_cache_root="/tmp/",
     ):
         """
         Dataset class for fetching sequences of experience.
@@ -93,6 +95,12 @@ class SequenceDataset(torch.utils.data.Dataset):
                 demonstrations to load
 
             load_next_obs (bool): whether to load next_obs from the dataset
+
+            materialize_to_local (bool): if True, copy the hdf5 file to a local directory
+                (see @local_cache_root) before opening, to avoid slow remote / network storage.
+
+            local_cache_root (str): directory where a local copy of the hdf5 should live
+                when @materialize_to_local is True. Defaults to "/tmp/robomimic_hdf5".
         """
         super(SequenceDataset, self).__init__()
 
@@ -100,6 +108,85 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.hdf5_use_swmr = hdf5_use_swmr
         self.hdf5_normalize_obs = hdf5_normalize_obs
         self._hdf5_file = None
+
+        # Optional: materialize the hdf5 to a local cache directory for faster i/o
+        self.materialize_to_local = materialize_to_local
+        self.local_cache_root = os.path.expanduser(local_cache_root) if local_cache_root is not None else None
+        self._original_hdf5_path = self.hdf5_path
+        if self.materialize_to_local and self.local_cache_root is not None:
+            try:
+                if not os.path.exists(self.local_cache_root):
+                    os.makedirs(self.local_cache_root, exist_ok=True)
+
+                dest_path = os.path.join(self.local_cache_root, os.path.basename(self.hdf5_path))
+                lock_path = dest_path + ".lock"
+
+                # Use a simple inter-process lock to avoid duplicate copies
+                import time
+                try:
+                    import fcntl
+                except Exception:
+                    fcntl = None
+
+                # Acquire lock (best-effort). If fcntl unavailable, fall back to busy wait on lock file existence.
+                lock_file = open(lock_path, "w")
+                locked = False
+                if fcntl is not None:
+                    while not locked:
+                        try:
+                            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            locked = True
+                        except BlockingIOError:
+                            print("Another worker is materializing the hdf5, waiting...")
+                            time.sleep(1)
+                else:
+                    # no fcntl: naive wait until copy completes (lock file removed at end)
+                    while os.path.exists(lock_path + ".busy") and not os.path.exists(dest_path):
+                        print("Another worker is materializing the hdf5, waiting...")
+                        time.sleep(1)
+                # Mark busy for non-fcntl case
+                open(lock_path + ".busy", "w").close()
+
+                # Copy if needed
+                if not os.path.exists(dest_path):
+                    print(f"Materializing hdf5 to local directory -> {dest_path} ...")
+                    try:
+                        # Prefer fsspec for remote URLs
+                        use_stream_copy = False
+                        try:
+                            import fsspec  # type: ignore
+                            if ("://" in self.hdf5_path) and not os.path.exists(self.hdf5_path):
+                                use_stream_copy = True
+                        except Exception:
+                            fsspec = None  # noqa: F841
+                        if use_stream_copy:
+                            with fsspec.open(self.hdf5_path, "rb") as src, open(dest_path, "wb") as dst:
+                                chunk = src.read(8 * 1024 * 1024)
+                                while chunk:
+                                    dst.write(chunk)
+                                    chunk = src.read(8 * 1024 * 1024)
+                        else:
+                            import shutil
+                            shutil.copy2(self.hdf5_path, dest_path)
+                    except Exception as e:
+                        print(f"Warning: failed to materialize hdf5 locally ({e}). Proceeding with original path.")
+                    else:
+                        # Successfully copied; switch to local path
+                        self.hdf5_path = dest_path
+                else:
+                    # Already present; use it
+                    self.hdf5_path = dest_path
+            finally:
+                # Release and clean lock markers
+                try:
+                    os.remove(lock_path + ".busy")
+                except Exception:
+                    pass
+                try:
+                    if 'lock_file' in locals():
+                        lock_file.close()
+                except Exception:
+                    pass
 
         assert hdf5_cache_mode in ["all", "all_nogetitem", "low_dim", None]
         self.hdf5_cache_mode = hdf5_cache_mode

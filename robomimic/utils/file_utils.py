@@ -96,12 +96,12 @@ def get_env_metadata_from_dataset(dataset_path):
             :`'type'`: type of environment, should be a value in EB.EnvType
             :`'env_kwargs'`: dictionary of keyword arguments to pass to environment constructor
     """
-    if "hdf5" in dataset_path:
+    if "hdf5" in str(dataset_path):
         dataset_path = os.path.expanduser(dataset_path)
         f = h5py.File(dataset_path, "r")
         env_meta = json.loads(f["data"].attrs["env_args"])
         f.close()
-    elif "zarr" in dataset_path:
+    elif "zarr" in str(dataset_path):
         import zarr
         from tfm.data.codecs import register_codecs
         register_codecs()
