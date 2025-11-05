@@ -10,6 +10,9 @@ from copy import deepcopy
 from contextlib import contextmanager
 
 import torch.utils.data
+import time
+from collections import defaultdict
+import io
 
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.obs_utils as ObsUtils
@@ -254,6 +257,19 @@ class SequenceDataset(torch.utils.data.Dataset):
 
         self.close_and_delete_hdf5_handle()
 
+        # Lightweight, opt-in profiling (env: TFM_DATA_PROFILE=1, TFM_DATA_PROFILE_EVERY=N)
+        try:
+            self._profile_enabled = bool(int(os.getenv("TFM_DATA_PROFILE", "0")))
+        except Exception:
+            self._profile_enabled = False
+        try:
+            self._profile_every = int(os.getenv("TFM_DATA_PROFILE_EVERY", "50"))
+        except Exception:
+            self._profile_every = 50
+        self._profile_totals = defaultdict(float)
+        self._profile_samples = 0
+
+
     def load_demo_info(self, filter_by_attribute=None, demos=None):
         """
         Args:
@@ -313,7 +329,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         This property allows for a lazy hdf5 file open.
         """
         if self._hdf5_file is None:
-            print(f"Opening hdf5 file {self.hdf5_path}.")
+            # print(f"Opening hdf5 file {self.hdf5_path}.")
             self._hdf5_file = h5py.File(self.hdf5_path, 'r', swmr=self.hdf5_use_swmr, libver='latest')
             # self._hdf5_file = h5py.File(self.hdf5_path, 'r', swmr=self.hdf5_use_swmr, libver='latest')
         return self._hdf5_file
@@ -403,6 +419,9 @@ class SequenceDataset(torch.utils.data.Dataset):
             if "camera_info" in hdf5_file["data/{}".format(ep)].attrs:
                 all_data[ep]["attrs"]["camera_info"] = json.loads(hdf5_file["data/{}".format(ep)].attrs["camera_info"])
                 # print(all_data[ep]["attrs"]["camera_info"])
+
+            if "language_instruction" in hdf5_file["data/{}".format(ep)].attrs:
+                all_data[ep]["attrs"]["language_instruction"] = hdf5_file["data/{}".format(ep)].attrs["language_instruction"]
 
         return all_data
 
@@ -500,7 +519,51 @@ class SequenceDataset(torch.utils.data.Dataset):
         else:
             # read from file
             hd5key = "data/{}/{}".format(ep, key)
-            ret = self.hdf5_file[hd5key]
+            if "mp4" in hd5key:
+                # Prefer decord lazy reader; fallback to OpenCV full decode if unavailable
+                t_make_vr = time.perf_counter() if self._profile_enabled else None
+                mp4_bytes = bytes(self.hdf5_file[hd5key][:])
+                ret = None
+                use_gpu = False
+                try:
+                    # Use BytesIO for decord video input
+                    from io import BytesIO
+                    mp4_file_like = BytesIO(mp4_bytes)
+                    ret = _DecordLazyVideo(mp4_file_like, use_gpu=use_gpu)
+                except Exception:
+                    # Fallback: OpenCV decode all frames (slower)
+                    import numpy as np
+                    import cv2
+                    import tempfile
+                    import os
+
+                    t_decode_start = time.perf_counter() if self._profile_enabled else None
+                    frames = []
+                    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
+                        tmp_file.write(mp4_bytes)
+                        tmp_path = tmp_file.name
+                    video_stream = cv2.VideoCapture(tmp_path)
+                    try:
+                        while video_stream.isOpened():
+                            ret_val, frame = video_stream.read()
+                            if not ret_val:
+                                break
+                            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            frames.append(frame)
+                    finally:
+                        video_stream.release()
+                        os.remove(tmp_path)
+                    if len(frames) == 0:
+                        ret = None
+                    else:
+                        ret = np.stack(frames)
+                    if self._profile_enabled and t_decode_start is not None:
+                        self._profile_totals["mp4_decode"] += (time.perf_counter() - t_decode_start)
+                    print("excepted")
+                if self._profile_enabled and t_make_vr is not None and isinstance(ret, _DecordLazyVideo):
+                    self._profile_totals["mp4_vr_init"] += (time.perf_counter() - t_make_vr)
+            else:
+                ret = self.hdf5_file[hd5key]
         return ret
 
     def __getitem__(self, index):
@@ -515,6 +578,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         """
         Main implementation of getitem when not using cache.
         """
+        t_total_start = time.perf_counter() if getattr(self, "_profile_enabled", False) else None
 
         demo_id = self._index_to_demo_id[index]
         demo_start_index = self._demo_id_to_start_indices[demo_id]
@@ -528,6 +592,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         demo_length_offset = 0 if self.pad_seq_length else (self.seq_length - 1)
         end_index_in_demo = demo_length - demo_length_offset
 
+        t_section = time.perf_counter() if self._profile_enabled else None
         meta = self.get_dataset_sequence_from_demo(
             demo_id,
             index_in_demo=index_in_demo,
@@ -535,24 +600,50 @@ class SequenceDataset(torch.utils.data.Dataset):
             num_frames_to_stack=self.n_frame_stack - 1, # note: need to decrement self.n_frame_stack by one
             seq_length=self.seq_length
         )
-        meta["camera_info"] = self.hdf5_cache[demo_id]["attrs"]["camera_info"][index_in_demo:index_in_demo+self.seq_length]
-        # camera_info is a list of dicts of dicts, convert it to a dict of dicts of lists
-        meta["camera_info"] = convert_camera_info_to_dict_of_lists(meta["camera_info"])
+        if self._profile_enabled and t_section is not None:
+            self._profile_totals["dataset_seq"] += (time.perf_counter() - t_section)
+        # Fetch camera_info and language_instruction from cache if present, otherwise read from HDF5 attrs
+        camera_info_seq = None
+        if (self.hdf5_cache is not None and demo_id in self.hdf5_cache
+                and "attrs" in self.hdf5_cache[demo_id]
+                and "camera_info" in self.hdf5_cache[demo_id]["attrs"]):
+            camera_info_seq = self.hdf5_cache[demo_id]["attrs"]["camera_info"][index_in_demo:index_in_demo+self.seq_length]
+        else:
+            with self.hdf5_file_opened() as f:
+                grp = f[f"data/{demo_id}"]
+                if "camera_info" in grp.attrs:
+                    try:
+                        camera_info_all = json.loads(grp.attrs["camera_info"])  # list per-frame
+                    except Exception:
+                        camera_info_all = grp.attrs["camera_info"]
+                    camera_info_seq = camera_info_all[index_in_demo:index_in_demo+self.seq_length]
 
-        # pad camera_info to the same length as the sequence if needed
-        for cam in meta["camera_info"]:
-            for k in meta["camera_info"][cam]:
-                # pad by repeating the last element if needed
-                if len(meta["camera_info"][cam][k]) < self.seq_length:
-                    last_elem = meta["camera_info"][cam][k][-1]
-                    num_to_pad = self.seq_length - len(meta["camera_info"][cam][k])
-                    meta["camera_info"][cam][k].extend([last_elem] * num_to_pad)
+        if camera_info_seq is not None:
+            # camera_info is a list of dicts of dicts, convert it to a dict of dicts of lists
+            meta["camera_info"] = convert_camera_info_to_dict_of_lists(camera_info_seq)
+            # pad camera_info to the same length as the sequence if needed
+            for cam in meta["camera_info"]:
+                for k in meta["camera_info"][cam]:
+                    if len(meta["camera_info"][cam][k]) < self.seq_length:
+                        last_elem = meta["camera_info"][cam][k][-1]
+                        num_to_pad = self.seq_length - len(meta["camera_info"][cam][k])
+                        meta["camera_info"][cam][k].extend([last_elem] * num_to_pad)
+
+        # language_instruction: prefer cache, else read from attrs
+        if self.hdf5_cache is not None and demo_id in self.hdf5_cache and "attrs" in self.hdf5_cache[demo_id] and "language_instruction" in self.hdf5_cache[demo_id]["attrs"]:
+            meta["language_instruction"] = self.hdf5_cache[demo_id]["attrs"]["language_instruction"]
+        else:
+            with self.hdf5_file_opened() as f:
+                grp = f[f"data/{demo_id}"]
+                if "language_instruction" in grp.attrs:
+                    meta["language_instruction"] = grp.attrs["language_instruction"]
 
         # determine goal index
         goal_index = None
         if self.goal_mode == "last":
             goal_index = end_index_in_demo - 1
 
+        t_section = time.perf_counter() if self._profile_enabled else None
         meta["obs"] = self.get_obs_sequence_from_demo(
             demo_id,
             index_in_demo=index_in_demo,
@@ -561,10 +652,16 @@ class SequenceDataset(torch.utils.data.Dataset):
             seq_length=self.seq_length,
             prefix="obs"
         )
+        if self._profile_enabled and t_section is not None:
+            self._profile_totals["obs_seq"] += (time.perf_counter() - t_section)
         if self.hdf5_normalize_obs:
+            t_norm = time.perf_counter() if self._profile_enabled else None
             meta["obs"] = ObsUtils.normalize_obs(meta["obs"], obs_normalization_stats=self.obs_normalization_stats)
+            if self._profile_enabled and t_norm is not None:
+                self._profile_totals["obs_normalize"] += (time.perf_counter() - t_norm)
 
         if self.load_next_obs:
+            t_section = time.perf_counter() if self._profile_enabled else None
             meta["next_obs"] = self.get_obs_sequence_from_demo(
                 demo_id,
                 index_in_demo=index_in_demo,
@@ -574,9 +671,15 @@ class SequenceDataset(torch.utils.data.Dataset):
                 prefix="next_obs"
             )
             if self.hdf5_normalize_obs:
+                t_norm = time.perf_counter() if self._profile_enabled else None
                 meta["next_obs"] = ObsUtils.normalize_obs(meta["next_obs"], obs_normalization_stats=self.obs_normalization_stats)
+                if self._profile_enabled and t_norm is not None:
+                    self._profile_totals["next_obs_normalize"] += (time.perf_counter() - t_norm)
+            if self._profile_enabled and t_section is not None:
+                self._profile_totals["next_obs_seq"] += (time.perf_counter() - t_section)
 
         if goal_index is not None:
+            t_section = time.perf_counter() if self._profile_enabled else None
             goal = self.get_obs_sequence_from_demo(
                 demo_id,
                 index_in_demo=goal_index,
@@ -586,8 +689,25 @@ class SequenceDataset(torch.utils.data.Dataset):
                 prefix="next_obs",
             )
             if self.hdf5_normalize_obs:
+                t_norm = time.perf_counter() if self._profile_enabled else None
                 goal = ObsUtils.normalize_obs(goal, obs_normalization_stats=self.obs_normalization_stats)
+                if self._profile_enabled and t_norm is not None:
+                    self._profile_totals["goal_normalize"] += (time.perf_counter() - t_norm)
             meta["goal_obs"] = {k: goal[k][0] for k in goal}  # remove sequence dimension for goal
+            if self._profile_enabled and t_section is not None:
+                self._profile_totals["goal_fetch"] += (time.perf_counter() - t_section)
+        
+        # Record total and maybe print running averages
+        if self._profile_enabled and t_total_start is not None:
+            self._profile_totals["getitem_total"] += (time.perf_counter() - t_total_start)
+            self._profile_samples += 1
+            if self._profile_samples % max(1, self._profile_every) == 0:
+                keys = sorted(self._profile_totals.keys())
+                avg_ms = {k: (self._profile_totals[k] / self._profile_samples) * 1000.0 for k in keys}
+                summary = ", ".join([f"{k}={avg_ms[k]:.1f}ms" for k in keys])
+                total_ms = avg_ms.get("getitem_total", 0.0)
+                throughput = (1000.0 / total_ms) if total_ms > 0 else 0.0
+                print(f"[DataProfile:SequenceDataset] N={self._profile_samples} | {summary} | it/s≈{throughput:.2f}", flush=True)
 
         return meta
 
@@ -629,9 +749,25 @@ class SequenceDataset(torch.utils.data.Dataset):
         seq = dict()
         for k in keys:
             data = self.get_dataset_for_ep(demo_id, k)
-            seq[k] = data[seq_begin_index: seq_end_index]
+            t_slice = time.perf_counter() if getattr(self, "_profile_enabled", False) else None
+            if "rgb" in k or "depth" in k:
+                seq[k] = data[seq_begin_index:min(demo_length, seq_begin_index+2)]
+            else:
+                seq[k] = data[seq_begin_index: seq_end_index]
+            
+            if getattr(self, "_profile_enabled", False) and t_slice is not None:
+                if hasattr(data, "_is_decord_lazy"):
+                    self._profile_totals["mp4_decode"] += (time.perf_counter() - t_slice)
+                else:
+                    self._profile_totals["hdf5_slice"] += (time.perf_counter() - t_slice)
 
+            if isinstance(data, _DecordLazyVideo):
+                del data._vr
+                del data
+        t_pad = time.perf_counter() if getattr(self, "_profile_enabled", False) else None
         seq = TensorUtils.pad_sequence(seq, padding=(seq_begin_pad, seq_end_pad), pad_same=True)
+        if getattr(self, "_profile_enabled", False) and t_pad is not None:
+            self._profile_totals["pad_sequence"] += (time.perf_counter() - t_pad)
         pad_mask = np.array([0] * seq_begin_pad + [1] * (seq_end_index - seq_begin_index) + [0] * seq_end_pad)
         pad_mask = pad_mask[:, None].astype(bool)
 
@@ -733,3 +869,61 @@ class SequenceDataset(torch.utils.data.Dataset):
         `DataLoader` documentation, for more info.
         """
         return None
+
+
+class _DecordLazyVideo:
+    """
+    Lightweight wrapper exposing numpy-like slicing over a decord VideoReader.
+    Only decodes requested frames via get_batch. Returns arrays as (N, H, W, C) uint8.
+    """
+    def __init__(self, file_like_or_path, use_gpu=False):
+        try:
+            from decord import VideoReader, cpu, gpu
+        except Exception as e:
+            raise ImportError("decord not available") from e
+        ctx = gpu(0) if use_gpu else cpu(0)
+        self._vr = VideoReader(file_like_or_path, ctx=ctx, num_threads=0)
+        self._is_decord_lazy = True
+
+    def __len__(self):
+        return len(self._vr)
+
+    def _indices_from_slice(self, s):
+        start, stop, step = s.start, s.stop, s.step
+        n = len(self)
+        if step is None:
+            step = 1
+        if start is None:
+            start = 0
+        if stop is None:
+            stop = n
+        # clamp
+        start = max(0, min(n, start))
+        stop = max(0, min(n, stop))
+        if step == 0:
+            raise ValueError("slice step cannot be zero")
+        return list(range(start, stop, step))
+
+    def __getitem__(self, idx):
+        # Single index -> (H, W, C)
+        if isinstance(idx, int):
+            frame = self._vr[idx]
+            return frame.asnumpy()
+        # Slice -> (N, H, W, C)
+        if isinstance(idx, slice):
+            inds = self._indices_from_slice(idx)
+            if len(inds) == 0:
+                import numpy as _np
+                return _np.zeros((0,), dtype=_np.uint8)
+            batch = self._vr.get_batch(inds)
+            return batch.asnumpy()
+        # List or array of indices -> (N, H, W, C)
+        try:
+            inds = list(idx)
+            if len(inds) == 0:
+                import numpy as _np
+                return _np.zeros((0,), dtype=_np.uint8)
+            batch = self._vr.get_batch(inds)
+            return batch.asnumpy()
+        except Exception:
+            raise TypeError(f"Unsupported index type for _DecordLazyVideo: {type(idx)}")
