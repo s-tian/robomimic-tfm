@@ -51,6 +51,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         load_next_obs=True,
         materialize_to_local=False,
         local_cache_root="/tmp/",
+        cache_prefix=None,
     ):
         """
         Dataset class for fetching sequences of experience.
@@ -118,10 +119,15 @@ class SequenceDataset(torch.utils.data.Dataset):
         self._original_hdf5_path = self.hdf5_path
         if self.materialize_to_local and self.local_cache_root is not None:
             try:
-                if not os.path.exists(self.local_cache_root):
-                    os.makedirs(self.local_cache_root, exist_ok=True)
+                if cache_prefix is not None:
+                    cache_dir = os.path.join(self.local_cache_root, cache_prefix)
+                else:
+                    cache_dir = self.local_cache_root
+                if not os.path.exists(cache_dir):
+                    os.makedirs(cache_dir, exist_ok=True)
 
-                dest_path = os.path.join(self.local_cache_root, os.path.basename(self.hdf5_path))
+                dest_path = os.path.join(cache_dir, os.path.basename(self.hdf5_path))
+
                 lock_path = dest_path + ".lock"
 
                 # Use a simple inter-process lock to avoid duplicate copies
@@ -422,6 +428,9 @@ class SequenceDataset(torch.utils.data.Dataset):
 
             if "language_instruction" in hdf5_file["data/{}".format(ep)].attrs:
                 all_data[ep]["attrs"]["language_instruction"] = hdf5_file["data/{}".format(ep)].attrs["language_instruction"]
+            if "language_instruction_strings" in hdf5_file["data/{}".format(ep)].attrs:
+                all_data[ep]["attrs"]["language_instruction_strings"] = json.loads(hdf5_file["data/{}".format(ep)].attrs["language_instruction_strings"])
+
 
         return all_data
 
@@ -632,12 +641,13 @@ class SequenceDataset(torch.utils.data.Dataset):
         # language_instruction: prefer cache, else read from attrs
         if self.hdf5_cache is not None and demo_id in self.hdf5_cache and "attrs" in self.hdf5_cache[demo_id] and "language_instruction" in self.hdf5_cache[demo_id]["attrs"]:
             meta["language_instruction"] = self.hdf5_cache[demo_id]["attrs"]["language_instruction"]
+            meta["language_instruction_strings"] = json.loads(self.hdf5_cache[demo_id]["attrs"]["language_instruction_strings"])
         else:
             with self.hdf5_file_opened() as f:
                 grp = f[f"data/{demo_id}"]
                 if "language_instruction" in grp.attrs:
                     meta["language_instruction"] = grp.attrs["language_instruction"]
-
+                    meta["language_instruction_strings"] = json.loads(grp.attrs["language_instruction_strings"])
         # determine goal index
         goal_index = None
         if self.goal_mode == "last":
@@ -750,7 +760,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         for k in keys:
             data = self.get_dataset_for_ep(demo_id, k)
             t_slice = time.perf_counter() if getattr(self, "_profile_enabled", False) else None
-            if "rgb" in k or "depth" in k:
+            if "rgb" in k or "depth" in k or "dino_features" in k:
                 seq[k] = data[seq_begin_index:min(demo_length, seq_begin_index+2)]
             else:
                 seq[k] = data[seq_begin_index: seq_end_index]
