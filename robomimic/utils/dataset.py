@@ -6,6 +6,7 @@ import os
 import json
 import h5py
 import numpy as np
+import hashlib
 from copy import deepcopy
 from contextlib import contextmanager
 
@@ -48,6 +49,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         hdf5_use_swmr=True,
         hdf5_normalize_obs=False,
         filter_by_attribute=None,
+        num_trajectories=None,
         load_next_obs=True,
         materialize_to_local=False,
         local_cache_root="/tmp/",
@@ -98,6 +100,9 @@ class SequenceDataset(torch.utils.data.Dataset):
             filter_by_attribute (str): if provided, use the provided filter key to look up a subset of
                 demonstrations to load
 
+            num_trajectories (int): if provided, limit the dataset to the first N trajectories after
+                applying any explicit demo selection or @filter_by_attribute mask.
+
             load_next_obs (bool): whether to load next_obs from the dataset
 
             materialize_to_local (bool): if True, copy the hdf5 file to a local directory
@@ -126,7 +131,16 @@ class SequenceDataset(torch.utils.data.Dataset):
                 if not os.path.exists(cache_dir):
                     os.makedirs(cache_dir, exist_ok=True)
 
-                dest_path = os.path.join(cache_dir, os.path.basename(self.hdf5_path))
+                source_basename = os.path.basename(self.hdf5_path)
+                source_stem, source_ext = os.path.splitext(source_basename)
+                source_fingerprint = hashlib.sha256(
+                    self._original_hdf5_path.encode("utf-8")
+                ).hexdigest()[:16]
+                # Fingerprint the source path so same-named datasets from different locations
+                # do not alias to the same materialized file.
+                dest_path = os.path.join(
+                    cache_dir, f"{source_stem}-{source_fingerprint}{source_ext}"
+                )
 
                 lock_path = dest_path + ".lock"
 
@@ -191,17 +205,26 @@ class SequenceDataset(torch.utils.data.Dataset):
                     os.remove(lock_path + ".busy")
                 except Exception:
                     pass
-                try:
-                    if 'lock_file' in locals():
+                if lock_file is not None:
+                    try:
+                        if fcntl is not None:
+                            fcntl.flock(lock_file, fcntl.LOCK_UN)  # Explicitly unlock
+                    except Exception:
+                        pass
+                    try:
                         lock_file.close()
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
         assert hdf5_cache_mode in ["all", "all_nogetitem", "low_dim", None]
         self.hdf5_cache_mode = hdf5_cache_mode
 
         self.load_next_obs = load_next_obs
         self.filter_by_attribute = filter_by_attribute
+        self.num_trajectories = num_trajectories
+        if self.num_trajectories is not None:
+            self.num_trajectories = int(self.num_trajectories)
+            assert self.num_trajectories > 0, "num_trajectories must be positive"
 
         # get all keys that needs to be fetched
         self.obs_keys = tuple(obs_keys)
@@ -297,6 +320,9 @@ class SequenceDataset(torch.utils.data.Dataset):
         # sort demo keys
         inds = np.argsort([int(elem[5:]) for elem in self.demos])
         self.demos = [self.demos[i] for i in inds]
+        if self.num_trajectories is not None:
+            print("SequenceDataset: limiting number of trajectories to {}...".format(self.num_trajectories))
+            self.demos = self.demos[:self.num_trajectories]
 
         self.n_demos = len(self.demos)
 
@@ -370,12 +396,15 @@ class SequenceDataset(torch.utils.data.Dataset):
         msg += " (\n\tpath={}\n\tobs_keys={}\n\tseq_length={}\n\tfilter_key={}\n\tframe_stack={}\n"
         msg += "\tpad_seq_length={}\n\tpad_frame_stack={}\n\tgoal_mode={}\n"
         msg += "\tcache_mode={}\n"
+        msg += "\ttrajectory_limit={}\n"
         msg += "\tnum_demos={}\n\tnum_sequences={}\n)"
         filter_key_str = self.filter_by_attribute if self.filter_by_attribute is not None else "none"
         goal_mode_str = self.goal_mode if self.goal_mode is not None else "none"
         cache_mode_str = self.hdf5_cache_mode if self.hdf5_cache_mode is not None else "none"
+        trajectory_limit_str = self.num_trajectories if self.num_trajectories is not None else "none"
         msg = msg.format(self.hdf5_path, self.obs_keys, self.seq_length, filter_key_str, self.n_frame_stack,
                          self.pad_seq_length, self.pad_frame_stack, goal_mode_str, cache_mode_str,
+                         trajectory_limit_str,
                          self.n_demos, self.total_num_sequences)
         return msg
 
@@ -761,7 +790,9 @@ class SequenceDataset(torch.utils.data.Dataset):
             data = self.get_dataset_for_ep(demo_id, k)
             t_slice = time.perf_counter() if getattr(self, "_profile_enabled", False) else None
             if "rgb" in k or "depth" in k or "dino_features" in k:
-                seq[k] = data[seq_begin_index:min(demo_length, seq_begin_index+2)]
+                obs_horizon = getattr(self, "obs_horizon", 2)
+                # print("observation horizon: ", obs_horizon)
+                seq[k] = data[seq_begin_index:min(demo_length, seq_begin_index+obs_horizon)]
             else:
                 seq[k] = data[seq_begin_index: seq_end_index]
             
@@ -937,3 +968,4 @@ class _DecordLazyVideo:
             return batch.asnumpy()
         except Exception:
             raise TypeError(f"Unsupported index type for _DecordLazyVideo: {type(idx)}")
+    

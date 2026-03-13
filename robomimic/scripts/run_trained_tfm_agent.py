@@ -57,6 +57,7 @@ import h5py
 import imageio
 import numpy as np
 from copy import deepcopy
+from collections import deque
 import tqdm
 import omegaconf
 import hydra
@@ -74,10 +75,93 @@ from robomimic.algo import RolloutPolicy
 from robomimic.scripts.dataset_states_to_obs import get_camera_info
 
 from tfm.models.utils.rotation_transformer import RotationTransformer
+from tfm.scripts.train_utils import encode_language_instruction
 
 rotation_converter = RotationTransformer(from_rep='axis_angle', to_rep='rotation_6d')
+TASK_ENCODING = None
 
-TASK_ID = 1
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
+
+
+def _get_eval_data_cfg(cfg):
+    data_cfg = omegaconf.OmegaConf.select(cfg, "data.data0")
+    if data_cfg is not None:
+        return data_cfg, "data.data0"
+    return cfg.data, "data"
+
+
+def _normalize_image_resolution(camera_heights, camera_widths):
+    height = camera_heights[0] if isinstance(camera_heights, (list, tuple)) else camera_heights
+    width = camera_widths[0] if isinstance(camera_widths, (list, tuple)) else camera_widths
+    return [height, width]
+
+
+def _get_obs_camera_resolution(obs, camera_name, fallback_height=None, fallback_width=None):
+    image_key = f"{camera_name}_image"
+    if image_key in obs:
+        image = obs[image_key]
+        if image.ndim >= 3 and image.shape[-1] in (1, 3):
+            return np.array(image.shape[-3:-1])
+        if image.ndim >= 3 and image.shape[-3] in (1, 3):
+            return np.array(image.shape[-2:])
+    if fallback_height is not None and fallback_width is not None:
+        return np.array([fallback_height, fallback_width])
+    return None
+
+
+def _build_camera_info(env, obs, camera_names, camera_heights=None, camera_widths=None):
+    if not EnvUtils.is_robosuite_env(env=env):
+        return {}
+
+    camera_info = get_camera_info(
+        env=env,
+        camera_names=camera_names,
+        camera_height=camera_heights,
+        camera_width=camera_widths,
+    )
+    for camera_name, params in camera_info.items():
+        for param_key, value in params.items():
+            camera_info[camera_name][param_key] = np.array(value)
+        resolution = _get_obs_camera_resolution(
+            obs,
+            camera_name,
+            fallback_height=camera_heights,
+            fallback_width=camera_widths,
+        )
+        if resolution is not None:
+            camera_info[camera_name]["resolution"] = resolution
+    return camera_info
+
+
+def _ensure_numpy_positive_strides(data):
+    def _fix_array(arr):
+        if any(stride < 0 for stride in arr.strides) or not arr.flags.c_contiguous:
+            return np.ascontiguousarray(arr)
+        return arr
+
+    return TensorUtils.map_ndarray(data, _fix_array)
+
+
+def _get_policy_obs_horizon(policy):
+    if hasattr(policy.policy, "e2e_policy"):
+        return policy.policy.e2e_policy.obs_horizon
+    if hasattr(policy.policy, "tfm_policy"):
+        return policy.policy.tfm_policy.obs_horizon
+    if hasattr(policy.policy, "obs_horizon"):
+        return policy.policy.obs_horizon
+    return 1
+
+
+def _stack_obs_history(obs_history):
+    stacked_obs = {}
+    latest_obs = obs_history[-1]
+    for key, value in latest_obs.items():
+        if isinstance(value, np.ndarray):
+            stacked_obs[key] = np.stack([obs[key] for obs in obs_history], axis=0)
+        else:
+            stacked_obs[key] = value
+    return stacked_obs
 
 def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5, return_obs=False, camera_names=None, camera_heights=None, camera_widths=None):
     """
@@ -111,6 +195,9 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
 
     # hack that is necessary for robosuite tasks for deterministic action playback
     obs = env.reset_to(state_dict)
+    obs = _ensure_numpy_positive_strides(obs)
+    obs_horizon = _get_policy_obs_horizon(policy)
+    obs_history = deque([deepcopy(obs) for _ in range(obs_horizon)], maxlen=obs_horizon)
 
     results = {}
     video_count = 0  # video frame counter
@@ -121,32 +208,33 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
         traj.update(dict(obs=[], next_obs=[]))
     try:
         for step_i in tqdm.tqdm(range(horizon)):
-            if EnvUtils.is_robosuite_env(env=env):
-                camera_info = get_camera_info(
-                    env=env,
-                    camera_names=camera_names, 
-                    camera_height=camera_heights, 
-                    camera_width=camera_widths,
-                )
-                for camera_name in camera_info.keys():
-                    # convert the 'intrinsics' and 'extrinsics' keys to np arrays
-                    for param_key in camera_info[camera_name].keys():
-                        camera_info[camera_name][param_key] = np.array(camera_info[camera_name][param_key])
-                    
+            stacked_obs = _stack_obs_history(obs_history)
+            camera_info = _build_camera_info(
+                env=env,
+                obs=stacked_obs,
+                camera_names=camera_names,
+                camera_heights=camera_heights,
+                camera_widths=camera_widths,
+            )
             # add camera info
-            obs["camera_info"] = camera_info
-            num_tasks = len(policy.policy.cfg.data)
-            obs["task_encoding"] = torch.nn.functional.one_hot(torch.tensor(TASK_ID), num_tasks).float().numpy()
+            stacked_obs["camera_info"] = camera_info
+            stacked_obs["task_encoding"] = TASK_ENCODING
+            # scale all image obs by 255 and convert to uint8 for more efficient storage and processing in the policy
+            for key in stacked_obs:
+                if key.endswith("_image") and stacked_obs[key].dtype == np.float32:
+                    stacked_obs[key] = (stacked_obs[key] * 255).astype(np.uint8)
             # get action from policy
-            act = policy(ob=obs)
+            act = policy.policy.get_action(obs_dict=stacked_obs)[0].detach().cpu().numpy()
             if "rot6d" in policy.policy.cfg.model and policy.policy.cfg.model.rot6d and policy.policy.cfg.model.predict_ee_actions:
-            # if True:
                 rot = act[..., 3:9]
                 rot = rotation_converter.inverse(rot)
                 act = np.concatenate([act[..., :3], rot, act[..., 9:]], axis=-1)
+            act[-1] = (act[-1] * 2) - 1
 
             # play action
             next_obs, r, done, _ = env.step(act)
+            next_obs = _ensure_numpy_positive_strides(next_obs)
+            obs_history.append(deepcopy(next_obs))
 
             # compute reward
             total_reward += r
@@ -173,7 +261,7 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
                 # Note: We need to "unprocess" the observations to prepare to write them to dataset.
                 #       This includes operations like channel swapping and float to uint8 conversion
                 #       for saving disk space.
-                traj["obs"].append(ObsUtils.unprocess_obs_dict(obs))
+                traj["obs"].append(ObsUtils.unprocess_obs_dict(stacked_obs))
                 traj["next_obs"].append(ObsUtils.unprocess_obs_dict(next_obs))
 
             # break if done or if success
@@ -222,6 +310,7 @@ def run_trained_agent(cfg):
     # read rollout settings
     rollout_num_episodes = cfg.rollout.n_rollouts
     rollout_horizon = cfg.rollout.horizon
+    data_cfg, data_cfg_path = _get_eval_data_cfg(cfg)
     if rollout_horizon is None:
         # read horizon from config
         config, _ = FileUtils.config_from_checkpoint(ckpt_dict=ckpt_dict)
@@ -229,9 +318,9 @@ def run_trained_agent(cfg):
 
     # create environment from saved checkpoint
     try:
-        env_meta = FileUtils.get_env_metadata_from_dataset(cfg.data.hdf5_path)
+        env_meta = FileUtils.get_env_metadata_from_dataset(data_cfg.hdf5_path)
     except:
-        env_meta = FileUtils.get_env_metadata_from_dataset(cfg.data.zarr_path)
+        env_meta = FileUtils.get_env_metadata_from_dataset(data_cfg.zarr_path)
     ### Uncomment for joint position control
     # controller_config = {
     #     'type': 'JOINT_POSITION', 
@@ -265,10 +354,11 @@ def run_trained_agent(cfg):
         use_image_obs=env_meta["env_kwargs"].get("use_camera_obs", False), 
         use_depth_obs=env_meta["env_kwargs"].get("camera_depths", False),
     ) 
-    omegaconf.OmegaConf.update(cfg, "data.data0.image_resolution", env_meta["env_kwargs"]["camera_heights"], force_add=True)
-
-    from robomimic.envs.wrappers import FrameStackWrapper
-    env = FrameStackWrapper(env, num_frames=2)
+    image_resolution = _normalize_image_resolution(
+        env_meta["env_kwargs"]["camera_heights"],
+        env_meta["env_kwargs"]["camera_widths"],
+    )
+    omegaconf.OmegaConf.update(cfg, f"{data_cfg_path}.image_resolution", image_resolution, force_add=True)
 
     # restore policy
     if cfg.target_class is not None:
@@ -304,8 +394,16 @@ def run_trained_agent(cfg):
     else:
         policy, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=cfg.ckpt_path, device=device, verbose=True)
 
-    global TASK_ID
-    TASK_ID = cfg.rollout.task_id
+    global TASK_ENCODING
+    task_language_instruction = data_cfg.get("task_language_instruction", "")
+    if task_language_instruction:
+        TASK_ENCODING = encode_language_instruction(task_language_instruction)
+    else:
+        num_tasks = len(cfg.data) if omegaconf.OmegaConf.select(cfg, "data.data0") is not None else 1
+        TASK_ENCODING = torch.nn.functional.one_hot(
+            torch.tensor(cfg.rollout.task_id),
+            num_tasks,
+        ).float().numpy()
 
     # maybe set seed
     if cfg.rollout.seed is not None:
@@ -379,7 +477,7 @@ def run_trained_agent(cfg):
         data_writer.close()
         print("Wrote dataset trajectories to {}".format(cfg.rollout.dataset_path))
 
-    env.env.env.close()
+    env.env.close()
 
 
 if __name__ == "__main__":
