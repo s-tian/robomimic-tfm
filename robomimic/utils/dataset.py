@@ -171,6 +171,7 @@ class SequenceDataset(torch.utils.data.Dataset):
                 open(lock_path + ".busy", "w").close()
 
                 # Copy if needed
+                print(f"Trying to materialize file {self._original_hdf5_path} to {dest_path}...")
                 if not os.path.exists(dest_path):
                     print(f"Materializing hdf5 to local directory -> {dest_path} ...")
                     try:

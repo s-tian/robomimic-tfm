@@ -91,6 +91,36 @@ def _get_eval_data_cfg(cfg):
     return cfg.data, "data"
 
 
+def _deep_update_dict(base, updates):
+    for key, value in updates.items():
+        if (
+            key in base
+            and isinstance(base[key], dict)
+            and isinstance(value, dict)
+        ):
+            _deep_update_dict(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def _apply_eval_env_overrides(env_meta, cfg):
+    env_name_override = omegaconf.OmegaConf.select(cfg, "rollout.env_name", default=None)
+    env_kwargs_update = omegaconf.OmegaConf.select(cfg, "rollout.env_kwargs_update", default=None)
+
+    if env_name_override:
+        print(f"[Eval] Overriding env name: {env_meta['env_name']} -> {env_name_override}")
+        env_meta["env_name"] = env_name_override
+
+    if env_kwargs_update is not None:
+        env_kwargs_update = omegaconf.OmegaConf.to_container(env_kwargs_update, resolve=True)
+        if env_kwargs_update:
+            print(f"[Eval] Merging env kwargs override: {env_kwargs_update}")
+            _deep_update_dict(env_meta["env_kwargs"], env_kwargs_update)
+
+    return env_meta
+
+
 def _normalize_image_resolution(camera_heights, camera_widths):
     height = camera_heights[0] if isinstance(camera_heights, (list, tuple)) else camera_heights
     width = camera_widths[0] if isinstance(camera_widths, (list, tuple)) else camera_widths
@@ -321,6 +351,7 @@ def run_trained_agent(cfg):
         env_meta = FileUtils.get_env_metadata_from_dataset(data_cfg.hdf5_path)
     except:
         env_meta = FileUtils.get_env_metadata_from_dataset(data_cfg.zarr_path)
+    env_meta = _apply_eval_env_overrides(env_meta, cfg)
     ### Uncomment for joint position control
     # controller_config = {
     #     'type': 'JOINT_POSITION', 
